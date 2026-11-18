@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+local_cookie.txt
+*cookie*.txt
+*cookie*.json
+.venv/
+venv/
+.idea/
+.vscode/

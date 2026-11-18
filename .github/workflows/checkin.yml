@@ -1,12 +1,16 @@
 name: 吾爱破解自动签到
 
 on:
-  workflow_dispatch: # 支持手动点击运行
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   checkin_job:
     name: 吾爱破解签到任务
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: 检出仓库代码
@@ -23,12 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 执行吾爱破解自动签到
+      - name: 执行吾爱破解自动签到与中枢上报
         env:
           POJIE52_COOKIE: ${{ secrets.POJIE52_COOKIE }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          CHECKIN_HUB_URL: "https://checkin.wwcoder.top"
+          CHECKIN_HUB_TOKEN: ${{ secrets.CHECKIN_HUB_TOKEN }}
+          HUB_MANAGED_NOTIFY: "true"
           MSG_TEMPLATE: ${{ vars.MSG_TEMPLATE || '1' }}
         run: |
           python main.py
-

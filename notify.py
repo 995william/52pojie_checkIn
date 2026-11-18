@@ -5,11 +5,12 @@
 1. 企业微信群机器人 (WECOM_WEBHOOK)
 2. PushPlus (PUSHPLUS_TOKEN)
 3. GitHub Actions Job Summary 渲染
+支持 HUB_MANAGED_NOTIFY 集中管控托管静默策略。
 """
 
+import logging
 import os
 import requests
-import logging
 
 logger = logging.getLogger("Notify")
 
@@ -23,9 +24,9 @@ def send_wecom(webhook: str, title: str, content: str):
     else:
         text_content = (
             f"【{title}】\n"
-            f"--------------------------------\n"
+            f"────────────\n"
             f"{content}\n"
-            f"--------------------------------"
+            f"────────────"
         )
     payload = {
         "msgtype": "text",
@@ -43,7 +44,7 @@ def send_wecom(webhook: str, title: str, content: str):
 
 def send_pushplus(token: str, title: str, content: str):
     """PushPlus 微信模板消息推送."""
-    url = "http://www.pushplus.plus/send"
+    url = "https://www.pushplus.plus/send"
     data = {
         "token": token,
         "title": title,
@@ -69,17 +70,22 @@ def write_github_summary(title: str, content: str):
             logger.debug(f"写入 GITHUB_STEP_SUMMARY 失败: {e}")
 
 
-def send(title: str, content: str, public_content: str = None):
+def send(title: str, content: str, public_content: str = None, skip_push: bool = False):
     """
     统一通知分发入口.
     :param title: 通知标题
     :param content: 推送到私密渠道（企微/PushPlus）的完整内容
-    :param public_content: 写入 GitHub Actions 公开 Summary 与控制台日志的脱敏内容（若未指定则使用 content）
+    :param public_content: 写入 GitHub Actions 公开 Summary 与控制台日志的脱敏内容
+    :param skip_push: 为 True 时仅写入 GitHub Job Summary，跳过外部企微/PushPlus 推送
     """
     summary_text = public_content if public_content is not None else content
 
     # 1. 写入 Actions 公开 Summary（已脱敏）
     write_github_summary(title, summary_text)
+
+    if skip_push:
+        logger.info("当前由管控中枢托管通知 (HUB_MANAGED_NOTIFY=true)，全部账号正常，跳过单仓直推（交由中枢汇总早报）。")
+        return
 
     # 2. 控制台日志
     logger.info(f"--- 准备向私有渠道分发推送通知 [{title}] ---")

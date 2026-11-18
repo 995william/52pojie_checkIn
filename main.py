@@ -1,30 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 吾爱破解（52pojie）自动化签到主程序
-支持纯 Python WAF 自动穿透、多账号批量打卡、状态智能判定与多渠道消息推送。
+支持纯 Python WAF 自动穿透、多账号批量打卡、状态智能判定、集中管控中枢数据上报与多渠道消息推送。
 """
 
+import http.client
+import logging
 import os
+import random
 import re
 import sys
 import time
-import random
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 try:
     from bs4 import BeautifulSoup
 except ImportError:
     BeautifulSoup = None
 
-
-import http.client
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
-
 import notify
 import waf_solver
+from hub_reporter import report_to_hub
 
 # 日志格式化配置
 logging.basicConfig(
@@ -126,7 +127,7 @@ def fetch_user_assets(session: requests.Session) -> Dict[str, str]:
             for li in soup.find_all('li'):
                 t = li.text.strip()
                 if '吾爱币' in t:
-                    m = re.search(r'(\d+)\s*CB', t)
+                    m = re.search(r'(\d+(?:\.\d+)?)\s*CB', t, re.I)
                     if m:
                         assets["cb"] = f"{m.group(1)} CB"
                 elif '积分:' in t and '总积分' in t:
@@ -139,7 +140,7 @@ def fetch_user_assets(session: requests.Session) -> Dict[str, str]:
 
         # 正则降级保障
         if assets["cb"] == "未知":
-            m_cb = re.search(r'吾爱币:\s*.*?(\d+)\s*CB', resp.text, re.S)
+            m_cb = re.search(r'吾爱币:\s*.*?(\d+(?:\.\d+)?)\s*CB', resp.text, re.S | re.I)
             if m_cb:
                 assets["cb"] = f"{m_cb.group(1)} CB"
         if assets["credit"] == "未知":
@@ -153,7 +154,6 @@ def fetch_user_assets(session: requests.Session) -> Dict[str, str]:
     except Exception as e:
         logger.warning(f"获取资产数据异常: {e}")
     return assets
-
 
 
 def parse_cookies(cookie_str: str) -> Dict[str, str]:
@@ -205,10 +205,9 @@ def parse_account_username(html: str) -> str:
 
 
 def mask_username(username: str) -> str:
-    """对账号名称进行安全脱敏，避免公开日志泄露真实账号/QQ号."""
+    """对账号名称进行安全脱敏，避免公开日志泄露真实用户名."""
     if not username or username in ("未知", "已登录用户"):
         return username
-    # 如果是 UID_xxxx 形式
     if username.startswith("UID_") and len(username) > 6:
         return f"UID_{username[4:6]}****{username[-2:]}"
     if len(username) <= 2:
@@ -216,8 +215,36 @@ def mask_username(username: str) -> str:
     elif len(username) <= 4:
         return username[0] + "**" + username[-1]
     else:
-        # 保留前2位和后2位，中间用固定星号遮盖（如 qq670607946 -> qq6****46）
+        # 保留前3位和后2位，中间用固定星号遮盖（如 user12345 -> use****45）
         return f"{username[:3]}****{username[-2:]}"
+
+
+def extract_cb_number(cb_str: str) -> Optional[float]:
+    """从吾爱币字符串（如 '388 CB'）提取浮点数."""
+    if not cb_str:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*CB", str(cb_str), re.I)
+    if not m:
+        m = re.search(r"^(\d+(?:\.\d+)?)$", str(cb_str).strip())
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def extract_reward_cb(msg_str: str) -> Optional[float]:
+    """从签到返回消息中尝试提取奖励吾爱币数值."""
+    if not msg_str:
+        return None
+    m = re.search(r"吾爱币[^\d]*(\d+(?:\.\d+)?)", str(msg_str))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
@@ -395,7 +422,6 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
             "group": assets["group"]
         }
 
-
     except requests.exceptions.RequestException as e:
         logger.error(f"[{account_index}] 网络请求异常: {e}")
         return {"index": str(account_index), "user": username, "status": "失败", "msg": f"网络异常: {e}"}
@@ -405,14 +431,15 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
 
 
 def build_report_text(results_list: List[Dict[str, str]], time_str: str, mask: bool = False) -> str:
-    """生成格式化签到汇报卡片文本，支持公开日志脱敏."""
+    """生成移动端零折行格式化签到汇报卡片文本，支持公开日志脱敏."""
+    divider = "────────────"
     report_lines = [
         "🔔【52Pojie 每日签到】",
-        "━━━━━━━━━━━━━━━"
+        divider,
     ]
     for idx, r in enumerate(results_list):
         if idx > 0:
-            report_lines.append("───────────────")
+            report_lines.append(divider)
         user_group = r.get('group', '未知')
         if user_group == '未知':
             user_group = '会员'
@@ -430,13 +457,96 @@ def build_report_text(results_list: List[Dict[str, str]], time_str: str, mask: b
         report_lines.append(f"🎉 状态：{status_text}")
         report_lines.append(f"💰 吾爱币：{r.get('cb', '未知')}")
 
-    report_lines.append("───────────────")
-    report_lines.append(f"⏰ 时间：{time_str}")
-    report_lines.append("━━━━━━━━━━━━━━━")
+    report_lines.append(divider)
+    report_lines.append(f"⏰ {time_str}")
     return "\n".join(report_lines)
 
 
+def sync_results_to_hub(results: List[Dict[str, str]], duration_ms: int, public_card: str) -> None:
+    """组装脱敏账号快照并上报至集中管控中枢."""
+    accounts_payload: List[Dict[str, Any]] = []
+    balances: List[float] = []
+    rewards: List[float] = []
+
+    for r in results:
+        raw_user = r.get("user", "未知")
+        masked_user = mask_username(raw_user) if raw_user else f"账号#{r.get('index', '1')}"
+        msg = r.get("msg", "")
+        cb_num = extract_cb_number(r.get("cb", ""))
+        reward_num = extract_reward_cb(msg)
+
+        if r.get("status") == "成功":
+            if "已签到" in msg or "已打卡" in msg:
+                acc_status = "already_signed"
+            else:
+                acc_status = "success"
+        else:
+            acc_status = "failed"
+
+        if cb_num is not None:
+            balances.append(cb_num)
+        if reward_num is not None:
+            rewards.append(reward_num)
+
+        accounts_payload.append({
+            "account_mask": masked_user,
+            "status": acc_status,
+            "reward_num": reward_num,
+            "balance_num": cb_num,
+            "unit": "CB",
+            "message": msg,
+            "extra": {
+                "credit": r.get("credit", "未知"),
+                "group": r.get("group", "未知"),
+            },
+        })
+
+    ok_set = {"success", "already_signed"}
+    ok_count = sum(1 for a in accounts_payload if a["status"] in ok_set)
+    total_count = len(accounts_payload)
+
+    if total_count == 0 or ok_count == 0:
+        hub_status = "failed"
+    elif ok_count < total_count:
+        hub_status = "partial"
+    elif all(a["status"] == "already_signed" for a in accounts_payload):
+        hub_status = "already_signed"
+    else:
+        hub_status = "success"
+
+    balance_total = round(sum(balances), 2) if balances else None
+    reward_total = round(sum(rewards), 2) if rewards else None
+
+    if balance_total is not None:
+        bal_disp = int(balance_total) if balance_total.is_integer() else balance_total
+        if reward_total is not None and reward_total > 0:
+            rew_disp = int(reward_total) if reward_total.is_integer() else reward_total
+            asset_text = f"{bal_disp} CB (+{rew_disp} CB)"
+        else:
+            asset_text = f"{bal_disp} CB"
+    else:
+        asset_text = "已签到" if hub_status in ok_set else "签到异常"
+
+    if total_count == 1:
+        summary_text = accounts_payload[0]["message"] or ("今日已签到" if hub_status == "already_signed" else "签到完成")
+    else:
+        summary_text = f"成功 {ok_count}/{total_count} 个账号"
+
+    report_to_hub(
+        project_slug="52pojie",
+        status=hub_status,
+        summary=summary_text,
+        duration_ms=duration_ms,
+        asset_text=asset_text,
+        reward_total=reward_total,
+        balance_total=balance_total,
+        raw_card=public_card,
+        accounts=accounts_payload,
+    )
+
+
 def main():
+    start_ts = time.time()
     logger.info("==========================================")
     logger.info("   吾爱破解（52pojie）自动签到任务启动   ")
     logger.info("==========================================")
@@ -456,12 +566,19 @@ def main():
     if not raw_cookies:
         warning_msg = (
             "未检测到环境变量 POJIE52_COOKIE 或 PJ52_COOKIE！\n"
-            "请前往 GitHub 仓库 -> Settings -> Secrets and variables -> Actions\n"
-            "新增 Repository secret: POJIE52_COOKIE，填入吾爱破解账号 Cookie 即可。"
+            "请前往管控中枢 https://checkin.wwcoder.top 或仓库 Actions Secrets 配置 POJIE52_COOKIE。"
         )
         logger.warning(warning_msg)
-        notify.send("吾爱破解签到提醒", warning_msg)
-        # 本地调试或首次配置时友好退出
+        duration_ms = int((time.time() - start_ts) * 1000)
+        report_to_hub(
+            project_slug="52pojie",
+            status="failed",
+            summary="未配置 POJIE52_COOKIE 凭据",
+            duration_ms=duration_ms,
+            asset_text="缺少凭据",
+            raw_card=warning_msg,
+        )
+        notify.send("吾爱破解签到提醒", warning_msg, skip_push=False)
         sys.exit(0)
 
     # 支持多账号（换行符、@@ 或 & 分隔）
@@ -482,8 +599,9 @@ def main():
             logger.info(f"等待 {sleep_time:.1f} 秒后处理下一个账号...")
             time.sleep(sleep_time)
 
+    duration_ms = int((time.time() - start_ts) * 1000)
+
     # 格式化最终汇报 (北京时间 UTC+8)
-    from datetime import timezone
     tz_beijing = timezone(timedelta(hours=8))
     beijing_time = datetime.now(tz_beijing).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -491,16 +609,22 @@ def main():
     private_summary = build_report_text(results, beijing_time, mask=False)
     public_summary = build_report_text(results, beijing_time, mask=True)
 
-    # 控制台日志仅输出脱敏版本，彻底杜绝开源后云端控制台泄露账号
+    # 控制台日志仅输出脱敏版本，杜绝公开控制台泄露账号
     logger.info("\n" + public_summary)
 
-    # 发送推送（私密通道推送 private_summary，公开 Actions Summary 写入 public_summary）
-    notify.send("52Pojie 每日签到", private_summary, public_content=public_summary)
+    # 同步标准化结果至集中管控中枢
+    sync_results_to_hub(results, duration_ms, public_summary)
+
+    has_failed = any(r["status"] != "成功" for r in results)
+    hub_managed = os.environ.get("HUB_MANAGED_NOTIFY", "").strip().lower() == "true"
+    skip_direct_push = hub_managed and not has_failed
+
+    # 发送推送（中枢托管且全部成功时静默单仓推送，失败时照常直推告警）
+    notify.send("52Pojie 每日签到", private_summary, public_content=public_summary, skip_push=skip_direct_push)
 
     logger.info("所有签到流程处理完毕。")
 
     # 若有任何账号未签到成功，退出码返回 1，以便 GitHub Actions 清晰展示失败状态
-    has_failed = any(r["status"] != "成功" for r in results)
     if has_failed:
         logger.error("检测到存在签到失败的账号，退出码设为 1。")
         sys.exit(1)
